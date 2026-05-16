@@ -598,7 +598,7 @@ PARTS_DB: dict[str, dict] = {
     "kpaComet":              {"mass": 0.085, "cost": 1300,  "category": "missile_aa"},
     "kpaAim160":             {"mass": 0.071, "cost": 2000,  "category": "missile_aa"},
     "kpaMeteor":             {"mass": 0.190, "cost": 3000,  "category": "missile_aa"},
-    "kpaAST3":               {"mass": 0.060, "cost": 1400,  "category": "bomb_unguided"},
+    "kpaAST3":               {"mass": 0.060, "cost": 1400,  "category": "missile_ag"},
     "kpaSiAW":               {"mass": 0.355, "cost": 2500,  "category": "missile_arad"},  # Stand-in Attack Weapon — anti-radiation
     "kpaLynx":               {"mass": 1.300, "cost": 2600,  "category": "missile_ag"},
     "kpaNeolidas":           {"mass": 1.450, "cost": 7500,  "category": "missile_ag"},
@@ -649,10 +649,12 @@ PARTS_DB: dict[str, dict] = {
     "bdRotBombBay":          {"mass": 0.375, "cost": 500,  "category": "weapon_mount"},
 
     # ---- BDA countermeasures / sensors / AI ----
-    "bahaChaffPod":          {"mass": 0.001, "cost": 600,  "category": "cm_chaff"},
-    "bahaCmPod":             {"mass": 0.001, "cost": 600,  "category": "cm_box"},
+    "bahaChaffPod":          {"mass": 0.001, "cost": 50,  "category": "cm_chaff"},
+    "bahaCmPod":             {"mass": 0.001, "cost": 50,  "category": "cm_box"},
+    "dcm_ChaffPod":          {"mass": 0.001, "cost": 50,  "category": "cm_chaff"},
+    "dcm_CmPod":             {"mass": 0.001, "cost": 50,  "category": "cm_box"},
     "bahaDecoyPod":          {"mass": 0.001, "cost": 600,  "category": "cm_box"},
-    "bahaSmokeCmPod":        {"mass": 0.003, "cost": 600,  "category": "cm_smoke"},
+    "bahaSmokeCmPod":        {"mass": 0.003, "cost": 50,  "category": "cm_smoke"},
     "bahaBubblePod":         {"mass": 0.001, "cost": 600,  "category": "cm_box"},
     "bahaFlarePod":          {"mass": 0.001, "cost": 600,  "category": "cm_flare"},  # estimate; mirrors chaff/cm pods
     "bahaECMJammer":         {"mass": 0.300, "cost": 1800, "category": "ecm_jammer"},
