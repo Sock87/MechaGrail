@@ -1442,6 +1442,93 @@ def fix_countermeasures(craft_text: str, allowed_boxes: int,
     return new_text, report
 
 
+def remove_parts_from_craft(craft_text: str, raw_names_to_remove: set) -> tuple[str, dict]:
+    """Rewrite a .craft file with selected PART blocks removed.
+
+    `raw_names_to_remove` is a set of raw_name strings (e.g.
+    "bahaRevolverCannon_4287859754") identifying the exact parts to delete.
+
+    Each PART block in a .craft file looks like:
+        PART
+        {
+            part = <raw_name>
+            ...
+            link = <other_raw_name>
+            sym = <other_raw_name>
+            ...
+        }
+    When a PART is removed we must also scrub any `link = <removed>` and
+    `sym = <removed>` lines from surviving PART blocks, otherwise KSP
+    errors on load. Returns (new_text, report).
+    """
+    import re
+
+    report = {
+        "removed_count": 0,
+        "removed_names": [],
+        "scrubbed_links": 0,
+        "scrubbed_syms": 0,
+    }
+
+    # Walk PART blocks; for each, decide keep or drop.
+    new_text_parts = []
+    pos = 0
+    while True:
+        m = re.search(r"\bPART\s*\{", craft_text[pos:])
+        if not m:
+            # No more PART blocks — keep the rest of the file as-is.
+            new_text_parts.append(craft_text[pos:])
+            break
+        block_outer_start = pos + m.start()
+        block_brace_open = pos + m.end()
+        # Emit text up to and including "PART {"
+        new_text_parts.append(craft_text[pos:block_brace_open])
+        depth = 1
+        j = block_brace_open
+        while j < len(craft_text) and depth > 0:
+            if craft_text[j] == "{": depth += 1
+            elif craft_text[j] == "}": depth -= 1
+            j += 1
+        # block contents are craft_text[block_brace_open : j-1] (inside braces)
+        # closing brace is at j-1
+        block_body = craft_text[block_brace_open:j]  # includes final }
+        # Find the raw_name in this PART
+        name_m = re.search(r"^\s*part\s*=\s*(\S+)", block_body, re.MULTILINE)
+        if name_m and name_m.group(1) in raw_names_to_remove:
+            # Drop this PART entirely. We already wrote "PART {" — undo.
+            # Pop the last piece (which was "...PART {") and replace with
+            # just the text before "PART".
+            new_text_parts.pop()
+            new_text_parts.append(craft_text[pos:block_outer_start])
+            report["removed_count"] += 1
+            report["removed_names"].append(name_m.group(1))
+        else:
+            # Keep this PART. Append body unchanged for now.
+            new_text_parts.append(block_body)
+        pos = j
+
+    new_text = "".join(new_text_parts)
+
+    # Now scrub link = / sym = references to removed parts.
+    for removed in raw_names_to_remove:
+        # link = removed_name (whole token, end of line)
+        link_pattern = re.compile(
+            rf"^[ \t]*link\s*=\s*{re.escape(removed)}\s*\r?\n",
+            re.MULTILINE
+        )
+        new_text, n_links = link_pattern.subn("", new_text)
+        report["scrubbed_links"] += n_links
+
+        sym_pattern = re.compile(
+            rf"^[ \t]*sym\s*=\s*{re.escape(removed)}\s*\r?\n",
+            re.MULTILINE
+        )
+        new_text, n_syms = sym_pattern.subn("", new_text)
+        report["scrubbed_syms"] += n_syms
+
+    return new_text, report
+
+
 def parse_craft(path: Path) -> tuple[str, list[Part]]:
     """Parse a .craft file into a ship name and list of Part objects."""
     text = path.read_text(encoding="utf-8", errors="replace")
@@ -2280,8 +2367,8 @@ def _build_gui():
 
             ttk.Button(top, text="Re-check",
                        command=self.on_check).pack(side=tk.RIGHT)
-            ttk.Button(top, text="Fix CMs",
-                       command=self.on_fix_cms).pack(side=tk.RIGHT, padx=(0, 6))
+            ttk.Button(top, text="Fix craft file",
+                       command=self.on_fix_craft).pack(side=tk.RIGHT, padx=(0, 6))
 
             # File label
             self.file_label = ttk.Label(self, text="No file loaded.",
@@ -2366,6 +2453,298 @@ def _build_gui():
         def _maybe_recheck(self):
             if self.parts:
                 self.on_check()
+
+        def on_fix_craft(self):
+            """Open the Fix Craft dialog: shows every offending category with
+            checkboxes for each individual part, lets the user choose which
+            ones to remove, then writes a fixed .craft file.
+
+            A degraded craft is better than a deleted one — players get to
+            decide what to sacrifice rather than losing the whole airframe.
+            """
+            if not self.parts or not self.craft_path:
+                messagebox.showinfo("Fix craft file",
+                                    "Open a .craft file first.")
+                return
+
+            craft_class = self.class_var.get()
+            checks, summary = evaluate(self.parts, craft_class)
+
+            # Determine which rules are violated and which parts are offenders
+            failed_rule_names = [c.name for c in checks if not c.passed]
+            warning_rule_names = [c.name for c in checks if c.warning]
+
+            if not failed_rule_names and not warning_rule_names:
+                messagebox.showinfo(
+                    "Fix craft file",
+                    "This craft already passes all rule checks — "
+                    "nothing to fix."
+                )
+                return
+
+            # Build category lists for the picker
+            weapon_cats = {"missile_aa", "missile_aa_cluster", "missile_ag",
+                           "missile_cruise", "missile_ss", "missile_arad",
+                           "missile_sidearm", "bomb_guided", "bomb_unguided",
+                           "rocket_pod"}
+            gun_parts   = [p for p in self.parts if p.category == "weapon_gun"]
+            missile_parts = [p for p in self.parts
+                             if p.has_missile_launcher
+                             and p.category != "submunition"]
+            cm_box_parts = [p for p in self.parts
+                            if any(c in p.cm_types
+                                   for c in ("CMDropper", "CMChaff", "CMFlare"))]
+            jammer_parts = [p for p in self.parts
+                            if p.has_ecm_jammer and not p.has_missile_launcher]
+
+            # Build the dialog
+            win = tk.Toplevel(self)
+            win.title("Fix craft file")
+            win.geometry("760x680")
+            win.transient(self)
+            win.grab_set()
+
+            # Top: violation summary
+            top = ttk.Frame(win, padding=8)
+            top.pack(side=tk.TOP, fill=tk.X)
+            ttk.Label(top,
+                      text=f"Craft: {self.ship_name}",
+                      font=("Segoe UI", 11, "bold")).pack(anchor=tk.W)
+            ttk.Label(top,
+                      text=f"Class: {craft_class.title()}  "
+                           f"|  Combat mass: {summary['combat_mass']:.2f}t  "
+                           f"|  Parts: {len(self.parts)}").pack(anchor=tk.W)
+            ttk.Separator(top).pack(fill=tk.X, pady=(6, 0))
+
+            if failed_rule_names or warning_rule_names:
+                viol = ttk.Frame(win, padding=(8, 4))
+                viol.pack(side=tk.TOP, fill=tk.X)
+                ttk.Label(viol, text="Violations:",
+                          font=("Segoe UI", 10, "bold")).pack(anchor=tk.W)
+                for c in checks:
+                    if not c.passed:
+                        mark = "⚠" if c.warning else "✗"
+                        color = "#aa8800" if c.warning else "#cc0000"
+                        lbl = ttk.Label(viol, text=f"  {mark} {c.name}: {c.detail}",
+                                        foreground=color, wraplength=720)
+                        lbl.pack(anchor=tk.W)
+
+            # Middle: scrollable picker
+            mid_frame = ttk.LabelFrame(win, text="Select items to remove",
+                                       padding=8)
+            mid_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True,
+                           padx=8, pady=4)
+
+            # Use a Canvas with a scrollbar for an arbitrarily long list
+            canvas = tk.Canvas(mid_frame, borderwidth=0, highlightthickness=0)
+            scrollbar = ttk.Scrollbar(mid_frame, orient="vertical",
+                                       command=canvas.yview)
+            scrollable = ttk.Frame(canvas)
+            scrollable.bind("<Configure>", lambda e: canvas.configure(
+                scrollregion=canvas.bbox("all")))
+            canvas.create_window((0, 0), window=scrollable, anchor="nw")
+            canvas.configure(yscrollcommand=scrollbar.set)
+            canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+            scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+            # Holders for checkbox state. Each entry: (part_obj, BooleanVar).
+            removal_vars: list[tuple] = []  # [(part, var), ...]
+            # CM cap option
+            cm_cap_var = tk.BooleanVar(value=False)
+
+            def add_section(parent, title, parts_list, default_state=False):
+                if not parts_list:
+                    return
+                ttk.Label(parent, text=title,
+                          font=("Segoe UI", 10, "bold")).pack(
+                    anchor=tk.W, pady=(8, 2))
+                # Group by base_name
+                from collections import defaultdict as _dd
+                grouped = _dd(list)
+                for p in parts_list:
+                    grouped[p.base_name].append(p)
+                for base_name in sorted(grouped):
+                    instances = grouped[base_name]
+                    sample = instances[0]
+                    # Header line for this part type
+                    cat_label = sample.category
+                    mass_each = sample.mass
+                    cost_each = sample.cost
+                    type_info = f"({cat_label}, {mass_each:.3f}t, {cost_each} funds each)"
+                    ttk.Label(parent,
+                              text=f"  {len(instances)}× {base_name} {type_info}",
+                              foreground="#444").pack(anchor=tk.W)
+                    # Checkbox per instance (use ID suffix for clarity)
+                    for inst in instances:
+                        v = tk.BooleanVar(value=default_state)
+                        removal_vars.append((inst, v))
+                        suffix = inst.raw_name.split("_")[-1]
+                        cb = ttk.Checkbutton(
+                            parent,
+                            text=f"      Remove {base_name}  (id …{suffix[-6:]})",
+                            variable=v,
+                        )
+                        cb.pack(anchor=tk.W)
+
+            # Section: missiles / bombs / rockets
+            if missile_parts:
+                add_section(scrollable, "Missiles / Bombs / Rocket pods",
+                            missile_parts)
+
+            # Section: guns
+            if gun_parts:
+                add_section(scrollable, "Fixed guns", gun_parts)
+
+            # Section: CM boxes
+            if cm_box_parts:
+                add_section(scrollable, "Countermeasure boxes", cm_box_parts)
+                # Option: also cap CM amounts (per-box ≤42 + drain total)
+                ttk.Separator(scrollable).pack(fill=tk.X, pady=4)
+                ttk.Checkbutton(
+                    scrollable,
+                    text="  Also: cap each CM box at 42 + drain total to "
+                         "allowed capacity (drains flares first)",
+                    variable=cm_cap_var,
+                ).pack(anchor=tk.W)
+
+            # Section: ECM jammers
+            if jammer_parts:
+                add_section(scrollable, "ECM jammers", jammer_parts)
+
+            # Bottom: action buttons + projection
+            bottom = ttk.Frame(win, padding=8)
+            bottom.pack(side=tk.BOTTOM, fill=tk.X)
+
+            preview_label = ttk.Label(bottom, text="", wraplength=720,
+                                       foreground="#0a6")
+            preview_label.pack(anchor=tk.W, pady=(0, 4))
+
+            def projected_summary():
+                """Recompute the verdict on the in-memory parts list with the
+                selected items removed."""
+                to_remove_ids = {p.raw_name for p, v in removal_vars if v.get()}
+                remaining = [p for p in self.parts
+                             if p.raw_name not in to_remove_ids]
+                _, s = evaluate(remaining, craft_class)
+                # Build a one-line projection
+                missile_line = (f"Missiles: {s['missile_total']:.2f}/"
+                                f"{s['allowed_missiles']:.2f}")
+                gun_line = (f"Gun: {s['gun_cost_per_ton']:.0f}/t "
+                            f"(limit 300)")
+                cm_line = (f"CMs: {s['cm_box_count']}/{s['allowed_cm_boxes']} "
+                           f"boxes, {s['cm_units_loaded']:.0f}/"
+                           f"{s['cm_units_allowed']:.0f} units")
+                preview_label.config(
+                    text=f"Projection after removals: {missile_line}  |  "
+                         f"{gun_line}  |  {cm_line}"
+                )
+
+            def on_recompute():
+                projected_summary()
+
+            def on_apply():
+                # Collect raw names to remove
+                to_remove_ids = {p.raw_name for p, v in removal_vars if v.get()}
+
+                # Read craft text fresh from disk so we don't compound edits
+                try:
+                    text = self.craft_path.read_text(encoding="utf-8",
+                                                      errors="replace")
+                except Exception as e:
+                    messagebox.showerror("Fix craft file",
+                                         f"Could not read craft file:\n{e}")
+                    return
+
+                # Step 1: remove parts (if any)
+                rem_report = {"removed_count": 0, "scrubbed_links": 0,
+                              "scrubbed_syms": 0}
+                if to_remove_ids:
+                    text, rem_report = remove_parts_from_craft(text,
+                                                                to_remove_ids)
+
+                # Step 2: cap CMs if requested. Need allowed_boxes for the
+                # POST-removal craft (since removing CM boxes changes count).
+                cm_report = {"boxes_capped": 0, "drained_units": 0.0,
+                             "before_total": 0.0, "after_total": 0.0,
+                             "allowed_total": 0}
+                if cm_cap_var.get():
+                    # Recompute allowed_boxes from post-removal craft
+                    tmp_path = Path("/tmp/__mechagrail_intermediate.craft")
+                    tmp_path.write_text(text, encoding="utf-8")
+                    try:
+                        _, tmp_parts = parse_craft(tmp_path)
+                        _, tmp_sum = evaluate(tmp_parts, craft_class)
+                        allowed_boxes = tmp_sum["allowed_cm_boxes"]
+                    except Exception:
+                        allowed_boxes = summary["allowed_cm_boxes"]
+                    text, cm_report = fix_countermeasures(text, allowed_boxes)
+
+                if (rem_report["removed_count"] == 0
+                        and cm_report["boxes_capped"] == 0
+                        and cm_report["drained_units"] == 0):
+                    messagebox.showinfo(
+                        "Fix craft file",
+                        "Nothing selected to fix."
+                    )
+                    return
+
+                # Ask: overwrite or new save?
+                summary_lines = [
+                    f"Applied fixes:",
+                    f"  Parts removed:       {rem_report['removed_count']}",
+                    f"  Link refs scrubbed:  {rem_report['scrubbed_links']}",
+                    f"  Sym refs scrubbed:   {rem_report['scrubbed_syms']}",
+                    f"  CM boxes capped:     {cm_report['boxes_capped']}",
+                    f"  CM units drained:    {cm_report['drained_units']:.0f}",
+                    "",
+                    "Do you want to overwrite the file? No makes a new save.",
+                ]
+                choice = messagebox.askyesnocancel(
+                    "Fix craft file",
+                    "\n".join(summary_lines),
+                    parent=win,
+                )
+                if choice is None:
+                    return  # Cancel — don't write anything
+                if choice:
+                    out_path = self.craft_path
+                else:
+                    out_path = self.craft_path.with_name(
+                        self.craft_path.stem + "_fixed"
+                        + self.craft_path.suffix
+                    )
+                try:
+                    out_path.write_text(text, encoding="utf-8")
+                except Exception as e:
+                    messagebox.showerror("Fix craft file",
+                                         f"Could not write fixed file:\n{e}")
+                    return
+
+                action = "Overwrote" if out_path == self.craft_path else "Saved"
+                messagebox.showinfo("Fix craft file",
+                                    f"{action}: {out_path.name}",
+                                    parent=win)
+
+                # Reload + re-check if we overwrote the loaded file
+                if out_path == self.craft_path:
+                    try:
+                        self.ship_name, self.parts = parse_craft(self.craft_path)
+                        self.on_check()
+                    except Exception:
+                        pass
+                win.destroy()
+
+            btn_bar = ttk.Frame(bottom)
+            btn_bar.pack(anchor=tk.E)
+            ttk.Button(btn_bar, text="Preview verdict",
+                       command=on_recompute).pack(side=tk.LEFT, padx=4)
+            ttk.Button(btn_bar, text="Apply",
+                       command=on_apply).pack(side=tk.LEFT, padx=4)
+            ttk.Button(btn_bar, text="Cancel",
+                       command=win.destroy).pack(side=tk.LEFT, padx=4)
+
+            # Compute initial projection (with nothing selected)
+            projected_summary()
 
         def on_fix_cms(self):
             """Cap each CM box's loaded amount at 42 and, if the total still
@@ -2602,4 +2981,5 @@ def main():
 
 
 if __name__ == "__main__":
+    main()
     main()
